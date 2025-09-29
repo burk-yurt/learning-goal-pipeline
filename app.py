@@ -71,3 +71,66 @@ async def ingest(req: IngestReq, x_api_key: Optional[str] = Header(None)):
 @app.get("/healthz")
 def health():
     return {"ok": True}
+
+
+# ---- Step 2: Goal Harvest ----
+class HarvestReq(BaseModel):
+    source_text: str
+    context: ContextBlock
+
+class HarvestResp(BaseModel):
+    broad_goals: List[str]
+    @validator("broad_goals")
+    def count_range(cls, v):
+        if not (3 <= len(v) <= 7):
+            raise ValueError("Must list 3–7 goals.")
+        return v
+
+@app.post("/harvest-goals", response_model=HarvestResp)
+async def harvest(req: HarvestReq, x_api_key: Optional[str] = Header(None)):
+    check_key(x_api_key)
+    prompt = (
+        "List 3–7 broad, student-observable end-state abilities implied by the text. "
+        "Avoid teaching activities. One sentence each, no metrics yet. "
+        "Quality check: No bare verbs like 'learn/understand'—use observable verbs. "
+        "Return JSON with key 'broad_goals'."
+    )
+    user = f"Context:\n{req.context.model_dump()}\n\nSource:\n{req.source_text}"
+    data = await call_llm(
+        [{"role":"system","content":prompt},{"role":"user","content":user}],
+        response_json=True
+    )
+    if "broad_goals" not in data or not isinstance(data["broad_goals"], list):
+        raise HTTPException(500, "Model did not return 'broad_goals' array.")
+    return data
+
+# ---- Step 3: Bloom & Knowledge Tagging ----
+class TagReq(BaseModel):
+    broad_goals: List[str]
+
+class TaggedGoal(BaseModel):
+    goal: str
+    bloom_process: Literal["Remember","Understand","Apply","Analyze","Evaluate","Create"]
+    knowledge_type: Literal["Factual","Conceptual","Procedural","Metacognitive"]
+    rationale: str = Field(max_length=120)
+
+class TagResp(BaseModel):
+    tagged_goals: List[TaggedGoal]
+
+@app.post("/tag-bloom-knowledge", response_model=TagResp)
+async def tag(req: TagReq, x_api_key: Optional[str] = Header(None)):
+    check_key(x_api_key)
+    prompt = (
+        "For each broad goal, assign Bloom process {Remember, Understand, Apply, Analyze, Evaluate, Create} "
+        "and knowledge {Factual, Conceptual, Procedural, Metacognitive}. "
+        "Briefly justify tagging in ≤12 words. Prefer higher-order + conceptual/procedural at top layer. "
+        "Return JSON: tagged_goals[]."
+    )
+    user = json.dumps({"broad_goals": req.broad_goals}, ensure_ascii=False)
+    data = await call_llm(
+        [{"role":"system","content":prompt},{"role":"user","content":user}],
+        response_json=True
+    )
+    if "tagged_goals" not in data:
+        raise HTTPException(500, "Missing 'tagged_goals'.")
+    return data
