@@ -6,8 +6,6 @@ import httpx
 
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
-if not OPENAI_API_KEY:
-    raise HTTPException(500, "Server misconfigured: OPENAI_API_KEY is not set.")
 app = FastAPI(title="Learning Goal Pipeline API", version="1.0.0")
 
 # ---- Types ----
@@ -23,6 +21,8 @@ class ContextBlock(BaseModel):
 
 # ---- LLM helper ----
 async def call_llm(messages, response_json: bool = True):
+    if not OPENAI_API_KEY:
+        raise HTTPException(500, "Server misconfigured: OPENAI_API_KEY is not set.")
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     payload = {"model": MODEL, "messages": messages}
     if response_json:
