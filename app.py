@@ -6,7 +6,8 @@ import httpx
 
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
-
+if not OPENAI_API_KEY:
+    raise HTTPException(500, "Server misconfigured: OPENAI_API_KEY is not set.")
 app = FastAPI(title="Learning Goal Pipeline API", version="1.0.0")
 
 # ---- Types ----
@@ -20,19 +21,13 @@ class ContextBlock(BaseModel):
     constraints: List[str]
     stakeholder_priorities: List[str]
 
-class TaggedGoal(BaseModel):
-    goal: str
-    bloom_process: Bloom
-    knowledge_type: Knowledge
-    rationale: str = Field(max_length=120)
-
 # ---- LLM helper ----
 async def call_llm(messages, response_json: bool = True):
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     payload = {"model": MODEL, "messages": messages}
     if response_json:
         payload["response_format"] = {"type": "json_object"}
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=120) as client:
         r = await client.post("https://api.openai.com/v1/chat/completions",
                               headers=headers, json=payload)
         r.raise_for_status()
@@ -123,14 +118,53 @@ async def tag(req: TagReq, x_api_key: Optional[str] = Header(None)):
     prompt = (
         "For each broad goal, assign Bloom process {Remember, Understand, Apply, Analyze, Evaluate, Create} "
         "and knowledge {Factual, Conceptual, Procedural, Metacognitive}. "
-        "Briefly justify tagging in ≤12 words. Prefer higher-order + conceptual/procedural at top layer. "
-        "Return JSON: tagged_goals[]."
+        "Return ONLY JSON with this exact shape:\n"
+        "{ \"tagged_goals\": ["
+        "  {\"goal\":\"...\",\"bloom_process\":\"...\",\"knowledge_type\":\"...\",\"rationale\":\"<=12 words\"}"
+        "]}\n"
+        "Keys must be exactly: goal, bloom_process, knowledge_type, rationale. "
+        "Prefer higher-order + conceptual/procedural at top layer. Rationale ≤12 words."
     )
     user = json.dumps({"broad_goals": req.broad_goals}, ensure_ascii=False)
     data = await call_llm(
         [{"role":"system","content":prompt},{"role":"user","content":user}],
         response_json=True
     )
-    if "tagged_goals" not in data:
-        raise HTTPException(500, "Missing 'tagged_goals'.")
-    return data
+
+    # --- normalize common alias keys from the model ---
+    def norm_case(s: str) -> str:
+        return s.capitalize() if isinstance(s, str) else s
+
+    raw = data.get("tagged_goals", [])
+    fixed = []
+    for g in raw:
+        if not isinstance(g, dict): 
+            continue
+        fixed.append({
+            "goal": g.get("goal") or g.get("Goal") or "",
+            "bloom_process": g.get("bloom_process") or g.get("process") or g.get("Bloom") or "",
+            "knowledge_type": g.get("knowledge_type") or g.get("knowledge") or g.get("Knowledge") or "",
+            "rationale": g.get("rationale") or g.get("justification") or g.get("why") or ""
+        })
+
+    # sanitize enums & trim rationale
+    allowed_bloom = {"Remember","Understand","Apply","Analyze","Evaluate","Create"}
+    allowed_knowledge = {"Factual","Conceptual","Procedural","Metacognitive"}
+    for g in fixed:
+        # normalize case
+        g["bloom_process"] = norm_case(g["bloom_process"])
+        g["knowledge_type"] = norm_case(g["knowledge_type"])
+        # clamp to allowed values if close matches
+        if g["bloom_process"] not in allowed_bloom:
+            # simple fallback: try title-case match or default to 'Apply'
+            g["bloom_process"] = g["bloom_process"].title()
+            if g["bloom_process"] not in allowed_bloom:
+                g["bloom_process"] = "Apply"
+        if g["knowledge_type"] not in allowed_knowledge:
+            g["knowledge_type"] = g["knowledge_type"].title()
+            if g["knowledge_type"] not in allowed_knowledge:
+                g["knowledge_type"] = "Conceptual"
+        # rationale max 120 chars
+        if isinstance(g["rationale"], str) and len(g["rationale"]) > 120:
+            g["rationale"] = g["rationale"][:117] + "..."
+    return {"tagged_goals": fixed}
