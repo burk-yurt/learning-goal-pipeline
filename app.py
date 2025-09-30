@@ -1,12 +1,19 @@
 import os, json
 from typing import List, Literal, Optional
 from fastapi import FastAPI, HTTPException, Header
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
+
 import httpx
 
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 app = FastAPI(title="Learning Goal Pipeline API", version="1.0.0")
+def check_key(x_api_key: Optional[str]):
+    expected = os.getenv("ACTION_API_KEY")
+    # If you set ACTION_API_KEY in your environment, enforce it; otherwise skip
+    if expected and x_api_key != expected:
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
 # ---- Types ----
 Bloom = Literal["Remember","Understand","Apply","Analyze","Evaluate","Create"]
@@ -24,20 +31,19 @@ async def call_llm(messages, response_json: bool = True):
     if not OPENAI_API_KEY:
         raise HTTPException(500, "Server misconfigured: OPENAI_API_KEY is not set.")
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    payload = {"model": MODEL, "messages": messages}
+    payload = {"model": MODEL, "messages": messages, "temperature": 0, "max_tokens": 8192}
     if response_json:
         payload["response_format"] = {"type": "json_object"}
     async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post("https://api.openai.com/v1/chat/completions",
-                              headers=headers, json=payload)
+        r = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload
+        )
         r.raise_for_status()
         content = r.json()["choices"][0]["message"]["content"]
     return json.loads(content) if response_json else content
 
-def check_key(x_api_key: Optional[str]):
-    expected = os.getenv("ACTION_API_KEY")
-    if expected and x_api_key != expected:
-        raise HTTPException(401, "Invalid or missing API key.")
 
 # ---- Step 1 endpoint: Ingest & Contextualize ----
 class IngestReq(BaseModel):
@@ -75,11 +81,14 @@ class HarvestReq(BaseModel):
 
 class HarvestResp(BaseModel):
     broad_goals: List[str]
-    @validator("broad_goals")
+
+    @field_validator("broad_goals")
+    @classmethod
     def count_range(cls, v):
         if not (3 <= len(v) <= 7):
             raise ValueError("Must list 3–7 goals.")
         return v
+
 
 @app.post("/harvest-goals", response_model=HarvestResp)
 async def harvest(req: HarvestReq, x_api_key: Optional[str] = Header(None)):
@@ -239,7 +248,10 @@ class GraphReq(BaseModel):
 
 class GraphResp(BaseModel):
     edges: List[Edge]
-    prerequisites: dict  # { objective_id: [ids...] }
+    from typing import Dict
+# ...
+prerequisites: Dict[str, List[str]]
+
 
 @app.post("/graph-dependencies", response_model=GraphResp)
 async def graph(req: GraphReq, x_api_key: Optional[str] = Header(None)):
@@ -425,7 +437,8 @@ async def coverage(req: CoverageReq, x_api_key: Optional[str] = Header(None)):
 class SequenceReq(BaseModel):
     objectives: List[ScoredObjective]
     edges: List[Edge]
-    constraints: List[str] = []
+    from pydantic import Field
+constraints: List[str] = Field(default_factory=list)
 
 class Module(BaseModel):
     name: str
@@ -483,77 +496,8 @@ async def sequence(req: SequenceReq, x_api_key: Optional[str] = Header(None)):
         ))
     return {"modules": modules}
 
-# ---- Step 10: Evidence & Assessment Alignment ----
-class AssessReq(BaseModel):
-    objectives: List[ScoredObjective]
-    modules: List[Module]
 
-class Assessment(BaseModel):
-    objective_id: str
-    format: Literal["selected","constructed","performance"]
-    samples: List[str]
-
-class AssessResp(BaseModel):
-    assessments: List[Assessment]
-
-@app.post("/align-assessments", response_model=AssessResp)
-async def assess(req: AssessReq, x_api_key: Optional[str] = Header(None)):
-    check_key(x_api_key)
-    prompt = (
-        "For each objective, propose 1–2 aligned assessment formats "
-        "(selected/constructed/performance) with sample items/tasks that directly elicit the behavior. "
-        "Match difficulty to Bloom level. Return ONLY JSON {\"assessments\":[{\"objective_id\":\"OBJ-1\",\"format\":\"performance\",\"samples\":[\"...\"]}]} ."
-    )
-    user = json.dumps({"objectives":[o.model_dump() for o in req.objectives],
-                       "modules":[m.model_dump() for m in req.modules]}, ensure_ascii=False)
-    data = await call_llm(
-        [{"role":"system","content":prompt},{"role":"user","content":user}],
-        response_json=True
-    )
-    arr = data.get("assessments", [])
-    fixed=[]
-    for a in arr:
-        fmt=a.get("format","constructed")
-        if fmt not in {"selected","constructed","performance"}: fmt="constructed"
-        fixed.append(Assessment(objective_id=a.get("objective_id",""),
-                                format=fmt,
-                                samples=a.get("samples",[])[:2]))
-    return {"assessments": fixed}
-
-# ---- Step 11: Rubric Seeds (Optional) ----
-class RubricReq(BaseModel):
-    objectives: List[ScoredObjective]   # pass top-priority subset if you want
-    max_rows: int = 5
-
-class RubricRow(BaseModel):
-    objective_id: str
-    levels: List[str]  # 4 ordered levels, discriminating on quality not quantity
-
-class RubricResp(BaseModel):
-    rows: List[RubricRow]
-
-@app.post("/seed-rubrics", response_model=RubricResp)
-async def rubrics(req: RubricReq, x_api_key: Optional[str] = Header(None)):
-    check_key(x_api_key)
-    prompt = (
-        "Create 4-level analytic rubric rows for the given objectives. "
-        "Descriptors must discriminate on quality (not just quantity) and tie to the criteria. "
-        "Return ONLY JSON {\"rows\":[{\"objective_id\":\"OBJ-1\",\"levels\":[\"...\",\"...\",\"...\",\"...\"]}]} ."
-    )
-    user = json.dumps({"objectives":[o.model_dump() for o in req.objectives[:req.max_rows]]}, ensure_ascii=False)
-    data = await call_llm(
-        [{"role":"system","content":prompt},{"role":"user","content":user}],
-        response_json=True
-    )
-    rows = data.get("rows", [])
-    fixed=[]
-    for r in rows:
-        lvls = r.get("levels", [])
-        if len(lvls) >= 4:
-            fixed.append(RubricRow(objective_id=r.get("objective_id",""), levels=lvls[:4]))
-    return {"rows": fixed}
-
-# ---- Step 12: Final Sanity & Risk Review ----
+# ---- Step 10: Final Sanity & Risk Review ----
 class ReviewReq(BaseModel):
     context: ContextBlock
     objectives: List[ScoredObjective]
@@ -586,3 +530,161 @@ async def review(req: ReviewReq, x_api_key: Optional[str] = Header(None)):
         "low_confidence": data.get("low_confidence", []),
         "questions": data.get("questions", [])
     }
+
+# ---- Export Relational Types ----
+class Table(BaseModel):
+    name: str
+    columns: List[str]
+    rows: List[List[str]]
+
+class ExportReq(BaseModel):
+    context: ContextBlock
+    tagged_goals: List[TaggedGoal]
+    objectives: List[Objective]  # or ScoredObjective if you have that class; otherwise Objective
+    edges: List[Edge]
+    modules: List[Module]
+
+class ExportResp(BaseModel):
+    tables: List[Table]
+    sqlite_ddl: str
+
+@app.post("/export-relational", response_model=ExportResp)
+async def export_relational(req: ExportReq, x_api_key: Optional[str] = Header(None)):
+    check_key(x_api_key)
+
+    # 1) Mint stable GOAL ids (GOAL-1..N) and a resolver to map any incoming goal_id field
+    goal_ids = {i: f"GOAL-{i}" for i in range(1, len(req.tagged_goals) + 1)}
+
+    def resolve_goal_id(gid):
+        if gid is None:
+            return None
+        s = str(gid).strip()
+        if s.isdigit():
+            i = int(s)
+            return goal_ids.get(i)
+        if s.upper().startswith("GOAL-"):
+            return s.upper()
+        return None  # unknown mapping
+
+    # 2) Build tables
+    goals_tbl = Table(
+        name="goals",
+        columns=["id", "goal_text", "bloom_process", "knowledge_type"],
+        rows=[
+            [f"GOAL-{i}", tg.goal, tg.bloom_process, tg.knowledge_type]
+            for i, tg in enumerate(req.tagged_goals, start=1)
+        ],
+    )
+
+    # Ensure each objective has an id; if your pipeline already assigns ids, use those
+    def obj_id(o, idx):
+        oid = getattr(o, "id", None)
+        return oid if oid else f"OBJ-{idx}"
+
+    objectives_rows = []
+    for idx, o in enumerate(req.objectives, start=1):
+        # Support SMART fields if present; fall back to blanks
+        behavior = getattr(o, "behavior", "")
+        condition = getattr(o, "condition", "")
+        degree = getattr(o, "degree", "")
+        bloom = getattr(o, "bloom", getattr(o, "bloom_process", ""))
+        knowledge = getattr(o, "knowledge", getattr(o, "knowledge_type", ""))
+        difficulty = getattr(o, "difficulty", None)
+        priority = getattr(o, "priority", None)
+        goal_id = resolve_goal_id(getattr(o, "goal_id", None))
+        objectives_rows.append([
+            obj_id(o, idx), goal_id, behavior, condition, degree,
+            bloom, knowledge, difficulty, priority
+        ])
+
+    objectives_tbl = Table(
+        name="objectives",
+        columns=["id","goal_id","behavior","condition","degree","bloom","knowledge","difficulty","priority"],
+        rows=objectives_rows,
+    )
+
+    edges_tbl = Table(
+        name="edges",
+        columns=["src_objective_id","dst_objective_id","type"],
+        rows=[[e.src, e.dst, e.type] for e in req.edges],
+    )
+
+    # Module ids M-1..N
+    mod_ids = {i: f"M-{i}" for i in range(1, len(req.modules) + 1)}
+    modules_tbl = Table(
+        name="modules",
+        columns=["id","name","checkpoint","rationale"],
+        rows=[
+            [mod_ids[i], getattr(m, "name", f"Module {i}"),
+             getattr(m, "checkpoint", "") or "",
+             getattr(m, "rationale", "") or ""]
+            for i, m in enumerate(req.modules, start=1)
+        ],
+    )
+
+    modobj_tbl = Table(
+        name="module_objectives",
+        columns=["module_id","objective_id"],
+        rows=[
+            [mod_ids[i], oid]
+            for i, m in enumerate(req.modules, start=1)
+            for oid in getattr(m, "objective_ids", [])
+        ],
+    )
+
+    context_tbl = Table(
+        name="context",
+        columns=["key","value"],
+        rows=[
+            ["domain", req.context.domain],
+            ["topic", req.context.topic],
+            ["audience", req.context.audience],
+            *[["constraint", c] for c in req.context.constraints],
+            *[["stakeholder_priority", s] for s in req.context.stakeholder_priorities],
+        ],
+    )
+
+    # 3) DDL for a clean, minimal relational schema
+    ddl = """
+CREATE TABLE goals(
+  id TEXT PRIMARY KEY,
+  goal_text TEXT,
+  bloom_process TEXT,
+  knowledge_type TEXT
+);
+CREATE TABLE objectives(
+  id TEXT PRIMARY KEY,
+  goal_id TEXT REFERENCES goals(id),
+  behavior TEXT,
+  condition TEXT,
+  degree TEXT,
+  bloom TEXT,
+  knowledge TEXT,
+  difficulty INTEGER,
+  priority INTEGER
+);
+CREATE TABLE edges(
+  src_objective_id TEXT REFERENCES objectives(id),
+  dst_objective_id TEXT REFERENCES objectives(id),
+  type TEXT,
+  PRIMARY KEY (src_objective_id, dst_objective_id)
+);
+CREATE TABLE modules(
+  id TEXT PRIMARY KEY,
+  name TEXT,
+  checkpoint TEXT,
+  rationale TEXT
+);
+CREATE TABLE module_objectives(
+  module_id TEXT REFERENCES modules(id),
+  objective_id TEXT REFERENCES objectives(id),
+  PRIMARY KEY (module_id, objective_id)
+);
+CREATE TABLE context(
+  key TEXT,
+  value TEXT
+);
+""".strip()
+
+    return {"tables": [goals_tbl, objectives_tbl, edges_tbl, modules_tbl, modobj_tbl, context_tbl],
+            "sqlite_ddl": ddl}
